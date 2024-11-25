@@ -3,7 +3,11 @@ const Datastore = require("nedb-promises");
 const bcrypt = require("bcryptjs");
 const morgan = require("morgan");
 const jwt = require("jsonwebtoken");
+const { authenticator } = require("otplib");
+const qrcode = require("qrcode");
 const config = require("./config");
+const crypto = require("crypto");
+const NodeCache = require("node-cache");
 
 // Initialize the app with express
 const app = express(0);
@@ -16,6 +20,8 @@ const userInvalidTokens = Datastore.create("X_UserInvalidTokens.db");
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
+
+const cache = new NodeCache();
 
 // Define the routes
 app.get("/", (req, res) => {
@@ -45,6 +51,8 @@ app.post("/api/auth/register", async (req, res) => {
       email,
       password: hashedPassword,
       role: role ?? "member",
+      "2faEnable": false,
+      "2faSecret": null,
     });
     // Remove the password field from the object
 
@@ -84,6 +92,89 @@ app.post("/api/auth/login", async (req, res) => {
         .json({ message: "Email or password is invalid , ErrorCode:PMm" });
     }
 
+    // If 2FA is enabled, send temp token to continue with 2FA
+    if (user["2faEnable"]) {
+      const tempToken = crypto.randomUUID();
+
+      cache.set(
+        config.cacheTemoraryTokenPrefix + tempToken,
+        user._id,
+        config.cacheTemporaryTokenExpiresInSeconds
+      );
+      return res.status(200).json({
+        tempToken,
+        expiresInSeconds: config.cacheTemporaryTokenExpiresInSeconds,
+      });
+    } else {
+      // Generate a JWT token
+      const accessToken = jwt.sign(
+        { userId: user._id },
+        config.accessTokenSecret,
+        {
+          subject: "accessAPI",
+          expiresIn: config.accessTokenExpiresIn,
+        }
+      );
+
+      // Generate Refresh Token
+      const refreshToken = jwt.sign(
+        { userId: user._id },
+        config.refreshTokenSecret,
+        {
+          subject: "refreshToken",
+          expiresIn: config.refreshTokenExpiresIn,
+        }
+      );
+
+      await userRefreshTokens.insert({
+        refreshToken,
+        userId: user._id,
+      });
+
+      // return the token
+      return res.status(200).json({
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        accessToken,
+        refreshToken,
+      });
+    }
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+// login with 2fa
+app.post("/api/auth/login/2fa", async (req, res) => {
+  try {
+    const { tempToken, totp } = req.body;
+
+    if (!tempToken || !totp) {
+      return res
+        .status(422)
+        .json({ message: "Please fill in all the fields (temptoken, totp" });
+    }
+
+    const userId = cache.get(config.cacheTemoraryTokenPrefix + tempToken);
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "The Provided temporary tocken is incorrect or expired",
+      });
+    }
+
+    const user = await users.findOne({ _id: userId });
+
+    const verified = authenticator.check(totp, user["2faSecret"]);
+
+    if (!verified) {
+      return res
+        .status(401)
+        .json({ message: "The provided TOTP is incorrect or expired!!" });
+    }
+
+    // send jwt token
     // Generate a JWT token
     const accessToken = jwt.sign(
       { userId: user._id },
@@ -191,6 +282,62 @@ app.post("/api/auth/refresh-token", async (req, res) => {
   }
 });
 
+// 2fa authentication
+app.get("/api/auth/2fa/generate", ensureAuthenticated, async (req, res) => {
+  try {
+    // get user details
+    const user = await users.findOne({ _id: req.user.id });
+    // generate secret key and URI
+    const secret = authenticator.generateSecret();
+    const uri = authenticator.keyuri(
+      user.email,
+      "rest-2fa-test-knk24.com",
+      secret
+    );
+
+    // save the secret in db for user
+    await users.update({ _id: req.user.id }, { $set: { "2faSecret": secret } });
+    await users.compactDatafile();
+
+    const qrCode = await qrcode.toBuffer(uri, { type: "image/png", margin: 1 });
+    res.setHeader("Content-Disposition", "attachement; filename=qrcode.png");
+    return res.status(200).type("image/png").send(qrCode);
+    //
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+// validated 2fa code
+app.post("/api/auth/2fa/validate", ensureAuthenticated, async (req, res) => {
+  try {
+    const { totp } = req.body;
+
+    // validate totp
+    if (!totp) {
+      return res.status(422).json({ message: "TOTP is required!" });
+    }
+
+    // Get user secret from db
+    const user = await users.findOne({ _id: req.user.id });
+
+    // verify the totp with user's secret
+    const verified = authenticator.check(totp, user["2faSecret"]);
+
+    if (!verified) {
+      return res
+        .status(400)
+        .json({ message: "TOTP is not correct or expired" });
+    }
+
+    await users.update({ _id: req.user.id }, { $set: { "2faEnable": true } });
+    await users.compactDatafile();
+    return res.status(200).json({ message: "TOTP Validated successfully!" });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
 // Logout User
 app.get("/api/auth/logout", ensureAuthenticated, async (req, res) => {
   // will logout from all the devices for the user
@@ -237,7 +384,7 @@ app.get("/api/admin", ensureAuthenticated, authorize(["admin"]), (req, res) => {
     .json({ message: "Hey Admin, You can access this route" });
 });
 
-// Moderator User
+// Moderator User /api/moderator
 app.get(
   "/api/moderator",
   ensureAuthenticated,

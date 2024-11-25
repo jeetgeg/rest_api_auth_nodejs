@@ -7,8 +7,8 @@ module.exports = {
   refreshTokenSecret: process.env.JWT_SECRET_REFRESH,
   refreshTokenExpiresIn: "1w",
 
-  cacheTemoraryTokenPrefix: "temporaryToken",
-  cacheTemporaryTokenExpiresInSeconds: 60 * 3,
+  cacheTemoraryTokenPrefix: "temp_token",
+  cacheTemporaryTokenExpiresInSeconds: 180,
 
   port: process.env.PORT,
 };
